@@ -22,18 +22,26 @@ rds_client = boto3.client('rds')
 cw_client = boto3.client('cloudwatch')
 targetMetricNamespace = os.environ.get('TargetMetricNamespace')
 
-dbSliceGroup = { "db.sql_tokenized", "db.application", "db.wait_event", "db.user", "db.session_type", "db.host", "db", "db.application" }
+dbSliceGroup = { 
+    "db.sql_tokenized", 
+    "db.wait_event", 
+    "db.user", 
+    "db.session_type", 
+    "db.host", 
+    "db", 
+    "db.application" 
+}
 
 
 def lambda_handler(event, context):
     # Get DB instances for which Performance Insights have been enabled
     pi_instances = get_pi_instances()
     logger.info('## PI Instances --> ')
-    for instance in pi_instances:
+    for [instance, rds_id] in pi_instances:
         pi_response = get_db_resource_metrics(instance)
 
         if pi_response:
-            send_cloudwatch_data(pi_response)
+            send_cloudwatch_data(pi_response, rds_id)
 
     return {
         'statusCode': 200,
@@ -48,7 +56,8 @@ def get_pi_instances():
         response = filter(lambda _: _.get('PerformanceInsightsEnabled', False), dbInstancesResponse['DBInstances'])
         
         if response:
-            dbInstanceList = [item['DbiResourceId'] for item in response]
+            dbInstanceList = [[item['DbiResourceId'],item['DBInstanceIdentifier']] for item in response]
+            logger.info("rds instances with pi enabled: {}".format([item for item in response]))
             return dbInstanceList
     return None
 
@@ -75,14 +84,19 @@ def get_db_resource_metrics(instance):
     if not metric_queries:
         return None
 
-    response = pi_client.get_resource_metrics(
-                ServiceType='RDS',
-                Identifier=instance,
-                StartTime= time.time() - 900,   #15 mins
-                EndTime= time.time(),
-                PeriodInSeconds=60,
-                MetricQueries=metric_queries
-            )
+    try:
+        response = pi_client.get_resource_metrics(
+                    ServiceType='RDS',
+                    Identifier=instance,
+                    StartTime= time.time() - 900,   #15 mins
+                    EndTime= time.time(),
+                    PeriodInSeconds=60,
+                    MetricQueries=metric_queries
+                )
+        logger.info("pi client response: {}".format(response))
+    except pi_client.exceptions.InvalidArgumentException as error:
+        logger.error('## Invalid Argument Exception --> %s ', error)
+        return None
 
     return response
 
@@ -94,9 +108,10 @@ def remove_non_ascii(string):
     non_ascii = ascii(string)
     return non_ascii
 
-def send_cloudwatch_data(pi_response):
+def send_cloudwatch_data(pi_response, rds_id):
     
     metric_data = []
+    db_identifier = pi_response.get('Identifier')
     
     for metric_response in pi_response['MetricList']: #dataoints and key
         metric_dict = metric_response['Key']  #db.load.avg
@@ -106,10 +121,13 @@ def send_cloudwatch_data(pi_response):
         formatted_dims = []
         if metric_dict.get('Dimensions'):
             metric_dimensions = metric_response['Key']['Dimensions']  # return a dictionary
-            
+            pid_identifier = str_encode(db_identifier).replace('\'','')
+            formatted_dims.append(dict(Name='identifier', Value=pid_identifier))
+            formatted_dims.append(dict(Name='rds_identifier', Value=rds_id))
+
             for key in metric_dimensions:
                 metric_name = key.split(".")[1]
-                formatted_dims.append(dict(Name=key, Value=str_encode(metric_dimensions[key])))
+                formatted_dims.append(dict(Name=key, Value=str_encode(metric_dimensions[key]).replace('\'','')))
                 """ if key == "db.sql_tokenized.statement":
                     formatted_dims.append(dict(Name=key, Value=str_encode(metric_dimensions[key])))
                 else:
@@ -139,15 +157,22 @@ def send_cloudwatch_data(pi_response):
                         'Value': round(datapoint['Value'], 2)
                     }) 
     
+    result = []
+    max_elements = 500
+    for i in range(0, len(metric_data), max_elements):
+        result.append(metric_data[i:i + max_elements])
+    
     if metric_data:
-        logger.info('## sending data to cloduwatch...')
-        try:
-            cw_client.put_metric_data(
-            Namespace= targetMetricNamespace,
-            MetricData= metric_data)
-        except ClientError as error:
-            raise ValueError('The parameters you provided are incorrect: {}'.format(error))
+        for entry in result:
+            logger.info('## sending data to cloduwatch: {}'.format(entry[:20]))
+            try:
+                cw_client.put_metric_data(
+                Namespace= targetMetricNamespace,
+                MetricData= entry)
+            except ClientError as error:
+                raise ValueError('The parameters you provided are incorrect: {}'.format(error))
     else:
         logger.info('## NO Metric Data ##')
+
 
 

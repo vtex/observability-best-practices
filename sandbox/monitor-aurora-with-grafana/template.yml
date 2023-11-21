@@ -4,7 +4,7 @@ Description: An AWS Lambda application that calls the API for Performance Insigh
 Parameters:
   TargetMetricNamespace:
     Type: String
-    Default: /AuroraMonitoringGrafana/PerformanceInsightMetrics
+    Default: /grafana/rds
     Description: Target Amazon CloudWatch namespace where you want to publish custom metrics
 Resources:
   function:
@@ -32,5 +32,3 @@ Resources:
             Name: RunPIExtractorLambda
             Description: Trigger Lambda execution on a schedule
             State: ENABLED
-
-
